@@ -9,15 +9,24 @@ import skimage.measure
 import wandb
 import torch
 torch.cuda.empty_cache()
+#set seed for reproducibility
+def set_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+set_seed(42)
 wandb.init(project='variable_length_bias')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 config = wandb.config
 # config.max_duration_en = 7.0
 # config.max_duration_cn = 3.0
 # config.max_duration_fr = 5.0
-config.max_duration_en = 3.0
+config.max_duration_en = 7.0
 config.max_duration_cn = 3.0
-config.max_duration_fr = 3.0
+config.max_duration_fr = 5.0
 metric = load_metric("accuracy")
 model_checkpoint = "facebook/wav2vec2-base"
 batch_size = 64
