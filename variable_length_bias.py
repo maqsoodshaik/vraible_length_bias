@@ -9,7 +9,9 @@ import skimage.measure
 import wandb
 import torch
 torch.cuda.empty_cache()
-
+#import plt
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 #set seed for reproducibility
 def set_seed(seed):
     # Set the random seed manually for reproducibility.
@@ -26,13 +28,9 @@ config = wandb.config
 config.max_duration_en = 7.0
 config.max_duration_cn = 3.0
 config.max_duration_fr = 5.0
-config.model = "xlsr"
-# config.max_duration_en = 3.0
-# config.max_duration_cn = 3.0
-# config.max_duration_fr = 3.0
 metric = load_metric("accuracy")
-model_checkpoint = "facebook/wav2vec2-large-xlsr-53"
-batch_size = 16
+model_checkpoint = "facebook/wav2vec2-base"
+batch_size = 64
 feature_extractor = AutoFeatureExtractor.from_pretrained(model_checkpoint)
 
 dataset_name = "fleurs"
@@ -147,16 +145,16 @@ from transformers import get_linear_schedule_with_warmup, AdamW
 optimizer = AdamW(best_model.parameters(), lr=3e-5)
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=len(train_dataloader)*config.epochs*0.1, num_training_steps=len(train_dataloader)*config.epochs)
 best_model = best_model.to(device)
-#accuracy_score from logits
+
 from sklearn.linear_model import LogisticRegression
 #import train_test_split
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+
 criterion = torch.nn.CrossEntropyLoss()
-def accuracy_score(preds, labels):
-    preds = np.argmax(preds, axis=1)
-    return (preds == labels).mean()
-def eval_func(eval_dataloader, best_model):
+
+#disable gradient calculation for the function
+@torch.no_grad()
+def eval_func(eval_dataloader, best_model,length):
     n_correct = 0
     n_samples = 0
     for batch in eval_dataloader:
@@ -170,32 +168,53 @@ def eval_func(eval_dataloader, best_model):
     acc = 100.0 * n_correct / len(encoded_dataset_test)
     print(f'Accuracy of the network on the validation images: {acc} %')
     #log to wandb
-    wandb.log({"Accuracy on validation": acc})
-def eval_hidden_func(eval_dataloader_hidden, best_model):
+    wandb.log({f"Accuracy on validation of {length}": acc})
+@torch.no_grad()
+def eval_hidden_func(eval_dataloader_hidden, best_model,length):
     labels_p= torch.tensor([])
+    logits_p = torch.tensor([])
     d = {}
+    
     for x in range(13):
         d[f"hidden_state_{x}"] = torch.tensor([])
     for batch in eval_dataloader_hidden:
         best_model.eval()
         batch = {k: v.to(device) for k, v in batch.items()}
         outputs = best_model(batch["input_values"])
+
         labels_s = batch["labels"].to("cpu")
         labels_p = torch.cat((labels_p,labels_s),0)
+        logits_p = torch.cat((logits_p,outputs.logits.to("cpu")),0)
         for num,hidden_state in enumerate(outputs.hidden_states):
                 #LogisticRegression from sklearn to predict the language
                 hidden_state = hidden_state.to("cpu")
+            
                 hidden_state = hidden_state.mean(dim=1)
                 hidden_state = hidden_state.reshape(hidden_state.shape[0], -1)
                 d[f"hidden_state_{num}"] = torch.cat((d[f"hidden_state_{num}"],hidden_state),0)
     for v in range(13):
-        X_train, X_test, y_train, y_test = train_test_split(d[f"hidden_state_{v}"], labels_p, test_size=0.2, random_state=42)
-        # #train logistic regression model
-        clf = LogisticRegression(random_state=0,max_iter=400).fit(X_train, y_train)
+        #plot the hidden states in 2 dimension using TSNE with labels_p as labels
+        tsne = TSNE(n_components=2, random_state=0)
+        X_2d = tsne.fit_transform(d[f"hidden_state_{v}"])
+        plt.figure(figsize=(10, 10))
+        plt.scatter(X_2d[:, 0], X_2d[:, 1], c=labels_p)
 
-        print(f"accuracy of hidden state level {v} is {clf.score(X_test, y_test)}")
-        #log accuracy of each hidden state level to wandb
-        wandb.log({f"accuracy of hidden state level for dataset of same size{v}":clf.score(X_test, y_test)})
+        #store the plot in wandb as image
+        wandb.log({f"TSNE plot of hidden state {v} of {length}": wandb.Image(plt)})
+        # X_train, X_test, y_train, y_test = train_test_split(d[f"hidden_state_{v}"], labels_p, test_size=0.2, random_state=42)
+        # #train logistic regression model
+        # clf = LogisticRegression(random_state=0,max_iter=400).fit(X_train, y_train)
+        # score = clf.score(X_test, y_test)
+        # print(f"accuracy of hidden state level {v} is {score}")
+        # #log accuracy of each hidden state level to wandb
+        # wandb.log({f"accuracy of hidden state level {v} for dataset of same size":score})
+    #plot the logits in 2 dimension using TSNE with labels_p as labels
+    tsne = TSNE(n_components=2, random_state=0)
+    X_2d = tsne.fit_transform(logits_p)
+    plt.figure(figsize=(10, 10))
+    plt.scatter(X_2d[:, 0], X_2d[:, 1], c=labels_p)
+    #store the plot in wandb as image
+    wandb.log({f"TSNE plot of logits of {length}": wandb.Image(plt)})
 for epoch in range(1, config.epochs + 1):
     print(f"Epoch {epoch}")
     n_correct = 0
@@ -208,8 +227,12 @@ for epoch in range(1, config.epochs + 1):
         print(f"loss in batch {batch_iter+1} is {loss}")
         #log loss using wandb
         wandb.log({"loss":loss})
-        with torch.no_grad():
-            eval_hidden_func(eval_dataloader_hidden, best_model)
+        if batch_iter % 10 == 0:
+            with torch.no_grad():
+                eval_hidden_func(eval_dataloader_hidden, best_model,"same")
+                eval_hidden_func(eval_dataloader, best_model,"different")
+                eval_func(eval_dataloader_hidden, best_model,"same")
+                eval_func(eval_dataloader, best_model,"different")
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -217,14 +240,8 @@ for epoch in range(1, config.epochs + 1):
     with torch.no_grad():
         eval_func(eval_dataloader, best_model)
     
-       
-    
-
-
-        
-    
 breakpoint()
 print(trainer.train())
-trainer.save_model( f"/pretrained/{model_name}_bestmodel_only_calssifier")
+trainer.save_model( f"/pretrained/{model_name}_bestmodel")
 print(trainer.evaluate())
 
